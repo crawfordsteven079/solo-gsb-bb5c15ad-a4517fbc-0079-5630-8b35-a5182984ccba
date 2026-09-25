@@ -171,3 +171,65 @@ class RobustRehearsalResult(BaseModel):
         ..., description="稳健分配方案（按设备编号排序）；无解时为空"
     )
     message: str
+
+
+class StartupDeviceIn(BaseModel):
+    """启动预演请求中的单台设备：须逐台给出启动瞬时功率。"""
+
+    id: str = Field(..., min_length=1, max_length=64, description="设备唯一编号")
+    startup_power: int = Field(
+        ..., gt=0, description="启动瞬时功率（正整数，且不低于该设备额定功率）"
+    )
+
+
+class StartupPlanRequest(BaseModel):
+    """启动顺序预演请求体（仅预演，不写入历史计算记录）。
+
+    设备编号须与原计算记录完全一致（逐台给出、不重不漏、顺序任意）；
+    各设备启动瞬时功率是否不低于额定功率需结合记录校验，不满足返回 422。
+    """
+
+    devices: list[StartupDeviceIn] = Field(
+        ..., min_length=1, max_length=12, description="逐台设备的启动瞬时功率"
+    )
+
+    @model_validator(mode="after")
+    def _unique_device_ids(self) -> "StartupPlanRequest":
+        ids = [d.id for d in self.devices]
+        if len(ids) != len(set(ids)):
+            raise ValueError("设备编号必须唯一")
+        return self
+
+
+class StartupStepItem(BaseModel):
+    """一次启动的负载快照：启动瞬间与启动完成后的稳定状态。"""
+
+    step: int = Field(..., ge=1, description="第几步启动（从 1 开始）")
+    device_id: str = Field(..., description="本步启动的设备编号")
+    startup_loads: Loads = Field(
+        ..., description="启动瞬间各相负载（该设备按启动瞬时功率计）"
+    )
+    stable_loads: Loads = Field(
+        ..., description="启动完成后各相稳定负载（该设备按额定功率计）"
+    )
+
+
+class StartupPlanResult(BaseModel):
+    """启动顺序预演结果。"""
+
+    id: int = Field(..., description="原计算记录 id")
+    created_at: str
+    capacities: Loads = Field(..., description="记录沿用的各相容量")
+    feasible: bool = Field(..., description="是否存在安全启动顺序")
+    order: Optional[list[str]] = Field(
+        None, description="最优启动顺序（设备编号序列）；无解时为 null"
+    )
+    steps: Optional[list[StartupStepItem]] = Field(
+        None,
+        description="逐步负载快照（启动瞬间与稳定状态，均不超容量）；无解时为 null",
+    )
+    peak: Optional[int] = Field(
+        None,
+        description="全过程各启动瞬间与稳定状态中三相最大负载与最小负载之差的峰值",
+    )
+    message: str

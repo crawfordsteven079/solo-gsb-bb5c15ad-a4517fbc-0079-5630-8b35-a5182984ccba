@@ -7,9 +7,11 @@ import unittest
 from app.solver import (
     Device,
     RobustDevice,
+    StartupDevice,
     solve,
     solve_capacity_upgrade,
     solve_robust,
+    solve_startup_plan,
 )
 
 PHASES = ("A", "B", "C")
@@ -539,6 +541,239 @@ class RobustSolveFuzzTest(unittest.TestCase):
         self.assertEqual(
             tuple(result.assignment[d.code] for d in ordered), exp_combo
         )
+
+
+def brute_force_startup(devices, capacities):
+    """启动顺序问题的朴素全枚举：返回 (峰值, 设备编号顺序, 逐步负载) 或 None。"""
+    best = None
+    for perm in itertools.permutations(devices):
+        loads = {p: 0 for p in PHASES}
+        peak = 0
+        steps = []
+        ok = True
+        for step, d in enumerate(perm, start=1):
+            loads[d.phase] += d.startup_power
+            startup_loads = dict(loads)
+            if loads[d.phase] > capacities[d.phase]:
+                ok = False
+                break
+            peak = max(peak, max(loads.values()) - min(loads.values()))
+            loads[d.phase] -= d.startup_power - d.power
+            stable_loads = dict(loads)
+            if loads[d.phase] > capacities[d.phase]:
+                ok = False
+                break
+            peak = max(peak, max(loads.values()) - min(loads.values()))
+            steps.append((step, d.code, startup_loads, stable_loads))
+        if not ok:
+            continue
+        key = (peak, tuple(d.code for d in perm))
+        if best is None or key < best[0]:
+            best = (key, steps)
+    return best
+
+
+class StartupPlanTest(unittest.TestCase):
+    def test_single_device(self):
+        devices = [StartupDevice("D1", "A", 10, 25)]
+        result = solve_startup_plan(devices, {"A": 30, "B": 0, "C": 0})
+        self.assertTrue(result.feasible)
+        self.assertEqual(result.order, ["D1"])
+        self.assertEqual(result.peak, 25)
+        self.assertEqual(len(result.steps), 1)
+        step = result.steps[0]
+        self.assertEqual(step.device_id, "D1")
+        self.assertEqual(step.startup_loads, {"A": 25, "B": 0, "C": 0})
+        self.assertEqual(step.stable_loads, {"A": 10, "B": 0, "C": 0})
+
+    def test_startup_power_equals_rated(self):
+        # 启动功率等于额定功率：瞬间即稳定
+        # D2 先：(0,1,0) 差 1 -> D1 瞬间 (2,1,0) 差 2，峰值 2；
+        # D1 先：(2,0,0) 差 2，峰值至少 2。两者峰值相同，取编号小者 D1 先。
+        devices = [
+            StartupDevice("D1", "A", 2, 2),
+            StartupDevice("D2", "B", 1, 1),
+        ]
+        result = solve_startup_plan(devices, {"A": 100, "B": 100, "C": 100})
+        self.assertTrue(result.feasible)
+        self.assertEqual(result.order, ["D1", "D2"])
+        self.assertEqual(result.peak, 2)
+
+    def test_lexicographic_tie_break(self):
+        # D1(A, p=2, s=3)、D2(B, p=1, s=4)。
+        # D1 先：瞬间 (3,0,0) 差 3，D2 瞬间 (2,4,0) 差 4，峰值 4；
+        # D2 先：瞬间 (0,4,0) 差 4，峰值 4。峰值相同，取编号小者 D1 先。
+        devices = [
+            StartupDevice("D1", "A", 2, 3),
+            StartupDevice("D2", "B", 1, 4),
+        ]
+        result = solve_startup_plan(devices, {"A": 100, "B": 100, "C": 100})
+        self.assertTrue(result.feasible)
+        self.assertEqual(result.order, ["D1", "D2"])
+        self.assertEqual(result.peak, 4)
+
+    def test_lexicographic_tie_equal_peak_same_phase(self):
+        # 两台同相、启动特性完全相同的设备：两种顺序等价，取编号升序
+        devices = [
+            StartupDevice("Z9", "A", 5, 9),
+            StartupDevice("A1", "A", 5, 9),
+        ]
+        result = solve_startup_plan(devices, {"A": 100, "B": 100, "C": 100})
+        self.assertTrue(result.feasible)
+        self.assertEqual(result.order, ["A1", "Z9"])
+        self.assertEqual(result.peak, 14)
+
+    def test_surge_requires_large_first(self):
+        # 浪涌大的设备必须先启动：X(s=9,p=8)、Y(s=7,p=4)，A 相容量 13
+        # Y 先：7 -> 稳定 4 -> X 瞬间 13 安全；X 先：9 -> 8 -> Y 瞬间 15 超容
+        devices = [
+            StartupDevice("X", "A", 8, 9),
+            StartupDevice("Y", "A", 4, 7),
+        ]
+        result = solve_startup_plan(devices, {"A": 13, "B": 0, "C": 0})
+        self.assertTrue(result.feasible)
+        self.assertEqual(result.order, ["Y", "X"])
+        self.assertEqual(result.steps[0].startup_loads, {"A": 7, "B": 0, "C": 0})
+        self.assertEqual(result.steps[1].startup_loads, {"A": 13, "B": 0, "C": 0})
+
+    def test_no_safe_order_single_phase(self):
+        # 两台设备任何顺序都超容量：A 相容量 10
+        # X 先：瞬间 6 安全，稳定 6，Y 瞬间 13 超容；反之亦然
+        devices = [
+            StartupDevice("X", "A", 6, 6),
+            StartupDevice("Y", "A", 7, 7),
+        ]
+        result = solve_startup_plan(devices, {"A": 10, "B": 0, "C": 0})
+        self.assertFalse(result.feasible)
+        self.assertIsNone(result.order)
+        self.assertIsNone(result.steps)
+        self.assertIsNone(result.peak)
+
+    def test_first_startup_exceeds_capacity(self):
+        devices = [StartupDevice("BIG", "A", 5, 11)]
+        result = solve_startup_plan(devices, {"A": 10, "B": 0, "C": 0})
+        self.assertFalse(result.feasible)
+
+    def test_stable_never_exceeds_capacity(self):
+        # 启动瞬间安全但最终稳定负载超容量（原记录可行时不会发生，
+        # 求解器仍须正确判定无解）
+        devices = [StartupDevice("D1", "A", 12, 12)]
+        result = solve_startup_plan(devices, {"A": 10, "B": 0, "C": 0})
+        self.assertFalse(result.feasible)
+
+    def test_step_loads_consistency(self):
+        devices = [
+            StartupDevice("D1", "A", 3, 8),
+            StartupDevice("D2", "B", 5, 9),
+            StartupDevice("D3", "C", 2, 6),
+        ]
+        caps = {"A": 100, "B": 100, "C": 100}
+        result = solve_startup_plan(devices, caps)
+        self.assertTrue(result.feasible)
+        self.assertEqual([s.step for s in result.steps], [1, 2, 3])
+        self.assertEqual(result.order, [s.device_id for s in result.steps])
+        prev = {"A": 0, "B": 0, "C": 0}
+        by_code = {d.code: d for d in devices}
+        peak = 0
+        for step in result.steps:
+            d = by_code[step.device_id]
+            expected_startup = dict(prev)
+            expected_startup[d.phase] += d.startup_power
+            expected_stable = dict(prev)
+            expected_stable[d.phase] += d.power
+            self.assertEqual(step.startup_loads, expected_startup)
+            self.assertEqual(step.stable_loads, expected_stable)
+            for p in PHASES:
+                self.assertLessEqual(step.startup_loads[p], caps[p])
+                self.assertLessEqual(step.stable_loads[p], caps[p])
+            peak = max(
+                peak,
+                max(step.startup_loads.values()) - min(step.startup_loads.values()),
+                max(step.stable_loads.values()) - min(step.stable_loads.values()),
+            )
+            prev = expected_stable
+        self.assertEqual(peak, result.peak)
+        # 终态稳定负载等于各相额定功率之和
+        self.assertEqual(prev, {"A": 3, "B": 5, "C": 2})
+
+
+class StartupPlanFuzzTest(unittest.TestCase):
+    """与朴素全排列枚举做随机对拍（含峰值、字典序顺序与逐步负载）。"""
+
+    def _check(self, cases, max_devices, seed):
+        rng = random.Random(seed)
+        for case in range(cases):
+            n = rng.randint(1, max_devices)
+            devices = []
+            for i in range(n):
+                power = rng.randint(1, 15)
+                startup = power + rng.randint(0, 10)
+                devices.append(
+                    StartupDevice(
+                        f"D{i:02d}", rng.choice(PHASES), power, startup
+                    )
+                )
+            capacities = {p: rng.randint(0, 60) for p in PHASES}
+            result = solve_startup_plan(devices, capacities)
+            expected = brute_force_startup(devices, capacities)
+            if expected is None:
+                self.assertFalse(
+                    result.feasible, f"case {case}: 应为无安全顺序"
+                )
+                continue
+            self.assertTrue(result.feasible, f"case {case}: 应存在安全顺序")
+            (exp_peak, exp_codes), exp_steps = expected
+            self.assertEqual(result.peak, exp_peak, f"case {case}: 峰值不符")
+            self.assertEqual(
+                tuple(result.order), exp_codes, f"case {case}: 字典序顺序不符"
+            )
+            for step, (_, code, startup_loads, stable_loads) in zip(
+                result.steps, exp_steps
+            ):
+                self.assertEqual(step.device_id, code)
+                self.assertEqual(step.startup_loads, startup_loads)
+                self.assertEqual(step.stable_loads, stable_loads)
+
+    def test_against_brute_force_small(self):
+        self._check(cases=400, max_devices=6, seed=20260925)
+
+    def test_against_brute_force_medium(self):
+        self._check(cases=150, max_devices=7, seed=20260926)
+
+    def test_twelve_devices_performance(self):
+        # 12 台设备、浪涌较大、容量偏紧：状态空间最大，应快速完成
+        rng = random.Random(20260927)
+        devices = [
+            StartupDevice(
+                f"D{i:02d}",
+                rng.choice(PHASES),
+                power := rng.randint(1, 30),
+                power + rng.randint(0, 40),
+            )
+            for i in range(12)
+        ]
+        capacities = {p: rng.randint(80, 250) for p in PHASES}
+        result = solve_startup_plan(devices, capacities)
+        # 结果自洽即可（容量紧时可能无解）
+        if result.feasible:
+            self.assertEqual(len(result.order), 12)
+            self.assertEqual(len(result.steps), 12)
+            self.assertEqual(len(set(result.order)), 12)
+
+    def test_twelve_devices_all_one_phase(self):
+        # 12 台全部在同一相：顺序问题退化为单相位排序
+        devices = [
+            StartupDevice(f"D{i:02d}", "A", 10, 10 + i) for i in range(12)
+        ]
+        result = solve_startup_plan(
+            devices, {"A": 1000, "B": 0, "C": 0}
+        )
+        self.assertTrue(result.feasible)
+        self.assertEqual(len(result.order), 12)
+        for step in result.steps:
+            self.assertEqual(step.startup_loads["B"], 0)
+            self.assertEqual(step.startup_loads["C"], 0)
+            self.assertLessEqual(step.startup_loads["A"], 1000)
 
 
 if __name__ == "__main__":
