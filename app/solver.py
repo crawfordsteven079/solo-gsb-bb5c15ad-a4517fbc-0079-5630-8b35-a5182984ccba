@@ -24,6 +24,23 @@
   （注意不是「上界最大值 - 下界最小值」：同一相不可能同时取到上界与下界）。
 据此归约为与 solve 同构的 DFS：容量约束作用于负载上界，目标函数为上述
 有序相异相位对差值的最大值，同值时取按设备编号排序的相位序列字典序最小者。
+
+启动顺序预演（solve_startup_plan）：沿用可行计算记录的固定相位与容量，
+每台设备另给定不低于额定功率的启动瞬时功率。设备一台接一台启动：启动瞬间
+该设备按启动功率计，此前已启动的设备按额定功率持续运行，启动完成后该设备
+亦按额定功率运行；每个启动瞬间与每个稳定状态各相负载均不得超容量。
+目标：最小化全过程「三相负载最大值与最小值之差」的峰值；同峰值取设备编号
+序列字典序最小的启动顺序。
+
+关键观察：任一启动顺序对应子集 DAG 上 空集→全集 的一条路径——途经节点为
+已启动设备集合（稳定状态），途经边为一次启动（瞬时状态）；节点与边的负载差
+只取决于集合 / 边本身，与到达路径无关。故「最小化全过程负载差峰值」等价于
+子集 DAG 上的 minimax 路径，按子集递推即可（n≤12，2^12 规模瞬时完成）；
+同峰值取编号序列字典序最小：先求最优峰值 P*，再自全集反向递推「途经状态
+负载差均不超 P* 且满足容量、可达全集」的子集集合，最后自空集出发按设备
+编号字典序贪心选边。容量方面：稳定状态负载是最终负载的部分和（记录可行时
+自动满足，求解器仍显式校验以独立成立）；启动瞬间需校验
+「启动前该相负载 + 启动功率 ≤ 该相容量」（其余相与稳定状态相同）。
 """
 
 from __future__ import annotations
@@ -468,4 +485,187 @@ def solve_robust(
         load_lower=final_lower,
         load_upper=final_upper,
         worst_imbalance=best_imbalance,
+    )
+
+
+@dataclass(frozen=True)
+class StartupDevice:
+    """启动顺序规划的设备：接入相位固定（沿用原计算记录）。"""
+
+    code: str  # 设备唯一编号
+    phase: str  # 固定接入相位（A/B/C）
+    rated_power: int  # 额定功率（正整数）
+    startup_power: int  # 启动瞬时功率（正整数，不低于额定功率）
+
+
+@dataclass(frozen=True)
+class StartupStepInfo:
+    """启动顺序中的一步：某台设备的启动瞬间与其后的稳定状态。"""
+
+    code: str  # 设备编号
+    phase: str  # 接入相位
+    rated_power: int  # 额定功率
+    startup_power: int  # 启动瞬时功率
+    transient_loads: dict[str, int]  # 启动瞬间各相负载
+    transient_imbalance: int  # 启动瞬间负载差
+    steady_loads: dict[str, int]  # 启动完成后各相稳定负载
+    steady_imbalance: int  # 稳定状态负载差
+
+
+@dataclass(frozen=True)
+class StartupPlanResult:
+    """启动顺序预演结果。feasible 为 False 时其余字段为 None。"""
+
+    feasible: bool
+    order: Optional[tuple[str, ...]]  # 启动顺序（设备编号）
+    steps: Optional[tuple[StartupStepInfo, ...]]  # 逐步瞬时 / 稳定负载
+    peak_imbalance: Optional[int]  # 全过程三相负载差峰值
+
+
+def solve_startup_plan(
+    devices: Iterable[StartupDevice], capacities: dict[str, int]
+) -> StartupPlanResult:
+    """求解安全启动顺序：全过程负载差峰值最小，同峰值取编号序列字典序最小。
+
+    设备一台接一台启动，接入相位固定。启动瞬间该设备按启动功率计，此前已
+    启动的设备按额定功率持续运行；启动完成后该设备亦按额定功率运行。每个
+    启动瞬间与每个稳定状态各相负载均不得超容量。无安全顺序时返回
+    feasible=False。
+
+    求解结构（详见模块 docstring）：启动顺序与子集 DAG 上 空集→全集 的路径
+    一一对应，节点 / 边的负载差与到达路径无关，故最小化峰值等价于 minimax
+    路径，按子集递推；再据最优峰值反向求可达全集的子集集合，自空集按设备
+    编号字典序贪心选出字典序最小的最优顺序。
+
+    :param devices: 设备集合（编号唯一、相位固定、0 < 额定功率 <= 启动功率）。
+    :param capacities: 各相容量，形如 {"A": int, "B": int, "C": int}。
+    :return: StartupPlanResult；无安全启动顺序时 feasible=False。
+    """
+    ordered = sorted(devices, key=lambda d: d.code)
+    n = len(ordered)
+    phase_of = [d.phase for d in ordered]
+    rated = [d.rated_power for d in ordered]
+    startup = [d.startup_power for d in ordered]
+    caps = {p: capacities[p] for p in PHASES}
+
+    size = 1 << n
+    full = size - 1
+
+    # steady_loads[mask]：已启动集合为 mask 时的稳定各相负载（额定功率部分和）
+    steady_loads: list[dict[str, int]] = [
+        {p: 0 for p in PHASES} for _ in range(size)
+    ]
+    steady_imb = [0] * size  # 各稳定状态的负载差
+    steady_ok = [True] * size  # 各稳定状态是否满足容量
+    for mask in range(1, size):
+        lsb = mask & (-mask)
+        i = lsb.bit_length() - 1
+        prev = steady_loads[mask ^ lsb]
+        cur = dict(prev)
+        cur[phase_of[i]] += rated[i]
+        steady_loads[mask] = cur
+        steady_imb[mask] = max(cur.values()) - min(cur.values())
+        steady_ok[mask] = all(cur[p] <= caps[p] for p in PHASES)
+
+    def transient(mask: int, i: int) -> tuple[dict[str, int], int]:
+        """状态 mask 下启动设备 i 的瞬时各相负载与负载差。"""
+        cur = dict(steady_loads[mask])
+        cur[phase_of[i]] += startup[i]
+        return cur, max(cur.values()) - min(cur.values())
+
+    def edge_ok(mask: int, i: int) -> bool:
+        """启动瞬间容量校验：仅该设备所在相负载变化，其余相同稳定状态。"""
+        p = phase_of[i]
+        return steady_loads[mask][p] + startup[i] <= caps[p]
+
+    # dist[mask]：到达 mask 的全过程负载差峰值的最小值；None 表示不可达。
+    # 路径代价为途经节点（稳定状态）与边（启动瞬间）负载差的最大值（minimax）；
+    # mask 的前驱均小于 mask，按整数序递推即可。
+    dist: list[Optional[int]] = [None] * size
+    dist[0] = 0
+    for mask in range(1, size):
+        if not steady_ok[mask]:
+            continue
+        best: Optional[int] = None
+        m = mask
+        while m:
+            lsb = m & (-m)
+            i = lsb.bit_length() - 1
+            m ^= lsb
+            prev_mask = mask ^ lsb
+            if dist[prev_mask] is None or not edge_ok(prev_mask, i):
+                continue
+            _, t_imb = transient(prev_mask, i)
+            candidate = max(dist[prev_mask], t_imb)
+            if best is None or candidate < best:
+                best = candidate
+        if best is not None:
+            dist[mask] = max(best, steady_imb[mask])
+
+    peak = dist[full]
+    if peak is None:
+        return StartupPlanResult(
+            feasible=False, order=None, steps=None, peak_imbalance=None
+        )
+
+    # can[mask]：自 mask 出发，途经状态负载差均不超 peak 且满足容量，可达全集
+    can = [False] * size
+    can[full] = True
+    for mask in range(full - 1, -1, -1):
+        if not steady_ok[mask]:
+            continue
+        for i in range(n):
+            bit = 1 << i
+            if mask & bit:
+                continue
+            nxt = mask | bit
+            if not can[nxt] or not edge_ok(mask, i):
+                continue
+            _, t_imb = transient(mask, i)
+            if t_imb <= peak and steady_imb[nxt] <= peak:
+                can[mask] = True
+                break
+
+    # 自空集出发按设备编号字典序贪心：每步选取后缀仍可完成的最小编号设备，
+    # 所得启动顺序即为同峰值下编号序列字典序最小者
+    order_idx: list[int] = []
+    mask = 0
+    while mask != full:
+        for i in range(n):  # 设备已按编号排序，即按编号序列字典序尝试
+            bit = 1 << i
+            if mask & bit:
+                continue
+            nxt = mask | bit
+            if not can[nxt] or not edge_ok(mask, i):
+                continue
+            _, t_imb = transient(mask, i)
+            if t_imb <= peak and steady_imb[nxt] <= peak:
+                order_idx.append(i)
+                mask = nxt
+                break
+        else:  # can[0] 为真时必然每步可选，不会走到这里
+            raise AssertionError("贪心构造启动顺序失败：无可行后继设备")
+
+    steps = []
+    mask = 0
+    for i in order_idx:
+        t_loads, t_imb = transient(mask, i)
+        mask |= 1 << i
+        steps.append(
+            StartupStepInfo(
+                code=ordered[i].code,
+                phase=phase_of[i],
+                rated_power=rated[i],
+                startup_power=startup[i],
+                transient_loads=t_loads,
+                transient_imbalance=t_imb,
+                steady_loads=dict(steady_loads[mask]),
+                steady_imbalance=steady_imb[mask],
+            )
+        )
+    return StartupPlanResult(
+        feasible=True,
+        order=tuple(ordered[i].code for i in order_idx),
+        steps=tuple(steps),
+        peak_imbalance=peak,
     )

@@ -17,8 +17,19 @@ from .schemas import (
     Loads,
     RobustRehearsalRequest,
     RobustRehearsalResult,
+    StartupPlanRequest,
+    StartupPlanResult,
+    StartupStep,
 )
-from .solver import Device, RobustDevice, solve, solve_capacity_upgrade, solve_robust
+from .solver import (
+    Device,
+    RobustDevice,
+    StartupDevice,
+    solve,
+    solve_capacity_upgrade,
+    solve_robust,
+    solve_startup_plan,
+)
 
 _MESSAGE_FEASIBLE = "计算成功：已找到三相负载最大值与最小值之差最小的分配方案"
 _MESSAGE_INFEASIBLE = "无可行分配：不存在所有设备均接入且各相不超容量的方案"
@@ -32,6 +43,12 @@ _MESSAGE_ROBUST_FEASIBLE = (
 )
 _MESSAGE_ROBUST_INFEASIBLE = (
     "无稳健可行分配：不存在任意功率组合下各相均不超容量的接入方案"
+)
+_MESSAGE_STARTUP_FEASIBLE = (
+    "预演成功：已找到全过程三相负载最大值与最小值之差峰值最小的安全启动顺序"
+)
+_MESSAGE_STARTUP_INFEASIBLE = (
+    "无安全启动顺序：不存在每个启动瞬间及稳定状态各相均不超容量的启动顺序"
 )
 
 
@@ -51,6 +68,9 @@ app = FastAPI(
         "每次计算的输入、分配结果与各相负载均持久化，可随时查询。"
         "另提供稳健分相预演：设备功率为正整数区间，求解任意功率组合下"
         "各相均不超容量、且最坏负载差最小的分配（仅预演，不持久化）。"
+        "对已有可行分配的计算记录，还可做启动顺序预演：逐台给定启动瞬时功率，"
+        "在固定相位与容量下求解全过程三相负载差峰值最小的一台接一台启动顺序"
+        "（仅预演，不修改历史记录）。"
     ),
     version="1.0.0",
     lifespan=lifespan,
@@ -261,5 +281,98 @@ def robust_rehearsal(payload: RobustRehearsalRequest) -> RobustRehearsalResult:
         assignments=assignments,
         message=(
             _MESSAGE_ROBUST_FEASIBLE if result.feasible else _MESSAGE_ROBUST_INFEASIBLE
+        ),
+    )
+
+
+@app.post(
+    "/api/v1/calculations/{calculation_id}/startup-plan",
+    response_model=StartupPlanResult,
+    tags=["calculations"],
+)
+def startup_plan(calculation_id: int, payload: StartupPlanRequest) -> StartupPlanResult:
+    """启动顺序预演：为已有可行分配的计算记录规划一台接一台的安全启动顺序。
+
+    沿用记录中的固定相位与容量，请求逐台给出启动瞬时功率（须为不低于额定
+    功率的正整数，且设备编号与记录完全一致）。设备一次启动一台：启动瞬间
+    该设备按启动功率计，完成后按额定功率持续运行；每个启动瞬间及稳定状态
+    各相均不得超容量。在所有安全启动顺序中，最小化全过程三相负载最大值与
+    最小值之差的峰值；同峰值时取设备编号序列字典序最小者。返回启动顺序、
+    逐步瞬时与稳定负载及峰值；无安全顺序时返回 ``feasible=false``。
+    仅做预演，不修改历史计算记录。
+
+    记录不存在返回 404；原记录无可行分配返回 409；启动功率低于额定功率
+    或设备编号与记录不一致返回 422。
+    """
+    record = db.get_calculation(calculation_id)
+    if record is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"计算记录不存在：id={calculation_id}",
+        )
+    if not record["feasible"]:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"计算记录无可行分配，无法规划启动顺序：id={calculation_id}",
+        )
+
+    record_devices = {d["device_id"]: d for d in record["devices"]}
+    request_powers = {
+        item.device_id: item.startup_power for item in payload.startup_powers
+    }
+    if set(request_powers) != set(record_devices):
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="设备编号须与计算记录完全一致（不多不少）",
+        )
+    for device_id, startup_power in request_powers.items():
+        rated = record_devices[device_id]["power"]
+        if startup_power < rated:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail=(
+                    f"启动瞬时功率不得低于额定功率："
+                    f"设备 {device_id} 额定功率为 {rated}"
+                ),
+            )
+
+    devices = [
+        StartupDevice(
+            code=d["device_id"],
+            phase=d["assigned_phase"],
+            rated_power=d["power"],
+            startup_power=request_powers[d["device_id"]],
+        )
+        for d in record["devices"]
+    ]
+    result = solve_startup_plan(devices, record["capacities"])
+
+    steps = (
+        [
+            StartupStep(
+                device_id=step.code,
+                phase=step.phase,
+                rated_power=step.rated_power,
+                startup_power=step.startup_power,
+                transient_loads=Loads(**step.transient_loads),
+                transient_imbalance=step.transient_imbalance,
+                steady_loads=Loads(**step.steady_loads),
+                steady_imbalance=step.steady_imbalance,
+            )
+            for step in result.steps
+        ]
+        if result.feasible
+        else []
+    )
+    return StartupPlanResult(
+        id=record["id"],
+        created_at=record["created_at"],
+        capacities=Loads(**record["capacities"]),
+        feasible=result.feasible,
+        peak_imbalance=result.peak_imbalance,
+        startup_order=list(result.order) if result.feasible else [],
+        steps=steps,
+        message=(
+            _MESSAGE_STARTUP_FEASIBLE if result.feasible else _MESSAGE_STARTUP_INFEASIBLE
         ),
     )

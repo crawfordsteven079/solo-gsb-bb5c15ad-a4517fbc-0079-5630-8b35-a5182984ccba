@@ -368,3 +368,209 @@ def test_robust_rehearsal_allowed_phases_deduplicated():
     resp = client.post("/api/v1/robust-rehearsals", json=payload)
     assert resp.status_code == 200
     assert resp.json()["feasible"] is True
+
+
+STARTUP_PLAN_PAYLOAD = {
+    "capacities": {"A": 10, "B": 10, "C": 10},
+    "devices": [
+        {"id": "D1", "power": 6, "allowed_phases": ["A"]},
+        {"id": "D2", "power": 4, "allowed_phases": ["B"]},
+        {"id": "D3", "power": 5, "allowed_phases": ["C"]},
+    ],
+}
+
+
+def _startup_body(mapping):
+    return {
+        "startup_powers": [
+            {"device_id": device_id, "startup_power": power}
+            for device_id, power in mapping.items()
+        ]
+    }
+
+
+def test_startup_plan_success():
+    created = _create(STARTUP_PLAN_PAYLOAD)
+    calc_id = created["id"]
+    assert created["feasible"] is True
+
+    resp = client.post(
+        f"/api/v1/calculations/{calc_id}/startup-plan",
+        json=_startup_body({"D1": 8, "D2": 6, "D3": 9}),
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["id"] == calc_id
+    assert body["capacities"] == {"A": 10, "B": 10, "C": 10}
+    assert body["feasible"] is True
+    # (D1,D2,D3) 与 (D2,D1,D3) 峰值同为 8，取编号序列字典序最小者
+    assert body["startup_order"] == ["D1", "D2", "D3"]
+    assert body["peak_imbalance"] == 8
+    assert len(body["steps"]) == 3
+    assert body["steps"][0] == {
+        "device_id": "D1",
+        "phase": "A",
+        "rated_power": 6,
+        "startup_power": 8,
+        "transient_loads": {"A": 8, "B": 0, "C": 0},
+        "transient_imbalance": 8,
+        "steady_loads": {"A": 6, "B": 0, "C": 0},
+        "steady_imbalance": 6,
+    }
+    assert body["steps"][1] == {
+        "device_id": "D2",
+        "phase": "B",
+        "rated_power": 4,
+        "startup_power": 6,
+        "transient_loads": {"A": 6, "B": 6, "C": 0},
+        "transient_imbalance": 6,
+        "steady_loads": {"A": 6, "B": 4, "C": 0},
+        "steady_imbalance": 6,
+    }
+    assert body["steps"][2] == {
+        "device_id": "D3",
+        "phase": "C",
+        "rated_power": 5,
+        "startup_power": 9,
+        "transient_loads": {"A": 6, "B": 4, "C": 9},
+        "transient_imbalance": 5,
+        "steady_loads": {"A": 6, "B": 4, "C": 5},
+        "steady_imbalance": 2,
+    }
+    assert "预演" in body["message"]
+
+
+def test_startup_plan_uses_record_fixed_phases():
+    # 沿用记录中的固定相位：VALID_PAYLOAD 的分配为 D1->A, D2->B, D3->C
+    created = _create(VALID_PAYLOAD)
+    calc_id = created["id"]
+    resp = client.post(
+        f"/api/v1/calculations/{calc_id}/startup-plan",
+        json=_startup_body({"D1": 15, "D2": 25, "D3": 35}),
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["feasible"] is True
+    phases = {step["device_id"]: step["phase"] for step in body["steps"]}
+    assert phases == {"D1": "A", "D2": "B", "D3": "C"}
+    # 末步稳定负载即原记录各相负载
+    assert body["steps"][-1]["steady_loads"] == created["loads"]
+    assert body["startup_order"] == ["D1", "D2", "D3"]
+    assert body["peak_imbalance"] == 25
+
+
+def test_startup_plan_404():
+    resp = client.post(
+        "/api/v1/calculations/999999/startup-plan",
+        json=_startup_body({"D1": 1}),
+    )
+    assert resp.status_code == 404
+
+
+def test_startup_plan_409_when_record_infeasible():
+    created = _create(INFEASIBLE_UPGRADE_PAYLOAD)
+    assert created["feasible"] is False
+    resp = client.post(
+        f"/api/v1/calculations/{created['id']}/startup-plan",
+        json=_startup_body({"BIG": 60, "FIX": 7}),
+    )
+    assert resp.status_code == 409
+
+
+def test_startup_plan_no_safe_order():
+    # 记录可行（D1 额定 10 接 A，容量 10），但启动功率 11 超容量：无安全顺序
+    created = _create({
+        "capacities": {"A": 10, "B": 0, "C": 0},
+        "devices": [{"id": "D1", "power": 10, "allowed_phases": ["A"]}],
+    })
+    assert created["feasible"] is True
+    resp = client.post(
+        f"/api/v1/calculations/{created['id']}/startup-plan",
+        json=_startup_body({"D1": 11}),
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["feasible"] is False
+    assert body["peak_imbalance"] is None
+    assert body["startup_order"] == []
+    assert body["steps"] == []
+    assert "无安全启动顺序" in body["message"]
+
+
+def test_startup_plan_validation_below_rated():
+    created = _create(VALID_PAYLOAD)
+    # D1 额定功率 10，启动功率 9 低于额定
+    resp = client.post(
+        f"/api/v1/calculations/{created['id']}/startup-plan",
+        json=_startup_body({"D1": 9, "D2": 20, "D3": 30}),
+    )
+    assert resp.status_code == 422
+    assert "额定功率" in resp.json()["detail"]
+
+
+def test_startup_plan_validation_missing_and_extra_ids():
+    created = _create(VALID_PAYLOAD)
+    # 缺少 D3、多出 D9：编号须与记录完全一致
+    resp = client.post(
+        f"/api/v1/calculations/{created['id']}/startup-plan",
+        json=_startup_body({"D1": 10, "D2": 20, "D9": 30}),
+    )
+    assert resp.status_code == 422
+
+
+def test_startup_plan_validation_duplicate_ids():
+    created = _create(VALID_PAYLOAD)
+    resp = client.post(
+        f"/api/v1/calculations/{created['id']}/startup-plan",
+        json={"startup_powers": [
+            {"device_id": "D1", "startup_power": 10},
+            {"device_id": "D1", "startup_power": 12},
+            {"device_id": "D2", "startup_power": 20},
+            {"device_id": "D3", "startup_power": 30},
+        ]},
+    )
+    assert resp.status_code == 422
+
+
+def test_startup_plan_validation_non_positive_power():
+    created = _create(VALID_PAYLOAD)
+    resp = client.post(
+        f"/api/v1/calculations/{created['id']}/startup-plan",
+        json=_startup_body({"D1": 0, "D2": 20, "D3": 30}),
+    )
+    assert resp.status_code == 422
+
+
+def test_startup_plan_validation_empty_body():
+    created = _create(VALID_PAYLOAD)
+    resp = client.post(
+        f"/api/v1/calculations/{created['id']}/startup-plan",
+        json={"startup_powers": []},
+    )
+    assert resp.status_code == 422
+
+
+def test_startup_plan_does_not_modify_record():
+    created = _create(VALID_PAYLOAD)
+    calc_id = created["id"]
+    before = client.get(f"/api/v1/calculations/{calc_id}").json()
+    count_before = len(client.get("/api/v1/calculations").json())
+
+    resp = client.post(
+        f"/api/v1/calculations/{calc_id}/startup-plan",
+        json=_startup_body({"D1": 15, "D2": 25, "D3": 35}),
+    )
+    assert resp.status_code == 200
+
+    # 预演不改历史：原记录内容与记录总数均不变
+    after = client.get(f"/api/v1/calculations/{calc_id}").json()
+    assert after == before
+    assert len(client.get("/api/v1/calculations").json()) == count_before
+
+    # 再次预演结果确定且相同（幂等读操作）
+    again = client.post(
+        f"/api/v1/calculations/{calc_id}/startup-plan",
+        json=_startup_body({"D1": 15, "D2": 25, "D3": 35}),
+    ).json()
+    assert again["startup_order"] == resp.json()["startup_order"]
+    assert again["peak_imbalance"] == resp.json()["peak_imbalance"]

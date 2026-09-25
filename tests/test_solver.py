@@ -7,9 +7,11 @@ import unittest
 from app.solver import (
     Device,
     RobustDevice,
+    StartupDevice,
     solve,
     solve_capacity_upgrade,
     solve_robust,
+    solve_startup_plan,
 )
 
 PHASES = ("A", "B", "C")
@@ -539,6 +541,254 @@ class RobustSolveFuzzTest(unittest.TestCase):
         self.assertEqual(
             tuple(result.assignment[d.code] for d in ordered), exp_combo
         )
+
+
+def brute_force_startup(devices, capacities):
+    """启动顺序规划的朴素全排列参照实现。
+
+    返回 (全过程负载差峰值, 编号顺序) 或 None（无安全顺序）。
+    """
+    ordered = sorted(devices, key=lambda d: d.code)
+    best = None
+    for perm in itertools.permutations(range(len(ordered))):
+        loads = {p: 0 for p in PHASES}
+        peak = 0
+        ok = True
+        for idx in perm:
+            device = ordered[idx]
+            # 启动瞬间：该设备按启动功率计，此前设备按额定功率运行
+            t_loads = dict(loads)
+            t_loads[device.phase] += device.startup_power
+            if any(t_loads[p] > capacities[p] for p in PHASES):
+                ok = False
+                break
+            peak = max(peak, max(t_loads.values()) - min(t_loads.values()))
+            # 启动完成：该设备转入额定功率持续运行
+            loads[device.phase] += device.rated_power
+            if any(loads[p] > capacities[p] for p in PHASES):
+                ok = False
+                break
+            peak = max(peak, max(loads.values()) - min(loads.values()))
+        if not ok:
+            continue
+        seq = tuple(ordered[i].code for i in perm)
+        if best is None or (peak, seq) < best:
+            best = (peak, seq)
+    return best
+
+
+class StartupPlanTest(unittest.TestCase):
+    def test_single_device(self):
+        devices = [StartupDevice("D1", "A", 10, 15)]
+        result = solve_startup_plan(devices, {"A": 20, "B": 0, "C": 0})
+        self.assertTrue(result.feasible)
+        self.assertEqual(result.order, ("D1",))
+        self.assertEqual(result.peak_imbalance, 15)
+        step = result.steps[0]
+        self.assertEqual(step.transient_loads, {"A": 15, "B": 0, "C": 0})
+        self.assertEqual(result.steps[0].transient_imbalance, 15)
+        self.assertEqual(step.steady_loads, {"A": 10, "B": 0, "C": 0})
+        self.assertEqual(step.steady_imbalance, 10)
+        self.assertEqual(step.rated_power, 10)
+        self.assertEqual(step.startup_power, 15)
+
+    def test_single_device_no_safe_order(self):
+        # 唯一设备启动功率 25 超 A 相容量 20（额定 10 可行）：无安全顺序
+        devices = [StartupDevice("D1", "A", 10, 25)]
+        result = solve_startup_plan(devices, {"A": 20, "B": 0, "C": 0})
+        self.assertFalse(result.feasible)
+        self.assertIsNone(result.order)
+        self.assertIsNone(result.steps)
+        self.assertIsNone(result.peak_imbalance)
+
+    def test_order_matters_for_feasibility(self):
+        # D1（额定6/启动10）与 D2（额定4/启动4）同接 A，容量 10：
+        # 先 D1 后 D2：10(瞬)→6(稳)→10(瞬) 安全；
+        # 先 D2 后 D1：4(稳)→4+10=14(瞬) 超容量，故安全顺序唯一
+        devices = [StartupDevice("D1", "A", 6, 10), StartupDevice("D2", "A", 4, 4)]
+        result = solve_startup_plan(devices, {"A": 10, "B": 0, "C": 0})
+        self.assertTrue(result.feasible)
+        self.assertEqual(result.order, ("D1", "D2"))
+        self.assertEqual(result.peak_imbalance, 10)
+        self.assertEqual(
+            result.steps[0].transient_loads, {"A": 10, "B": 0, "C": 0}
+        )
+        self.assertEqual(result.steps[0].steady_loads, {"A": 6, "B": 0, "C": 0})
+        self.assertEqual(
+            result.steps[1].transient_loads, {"A": 10, "B": 0, "C": 0}
+        )
+        self.assertEqual(result.steps[1].steady_loads, {"A": 10, "B": 0, "C": 0})
+
+    def test_order_matters_for_peak(self):
+        # 三相各一台：D3 启动功率最大，后启动可由已运行的其他相拉小负载差
+        devices = [
+            StartupDevice("D1", "A", 6, 8),
+            StartupDevice("D2", "B", 4, 6),
+            StartupDevice("D3", "C", 5, 9),
+        ]
+        caps = {"A": 10, "B": 10, "C": 10}
+        result = solve_startup_plan(devices, caps)
+        self.assertTrue(result.feasible)
+        # (D1,D2,D3) 与 (D2,D1,D3) 峰值均为 8，取编号序列字典序最小者
+        self.assertEqual(result.order, ("D1", "D2", "D3"))
+        self.assertEqual(result.peak_imbalance, 8)
+
+    def test_lexicographic_tie_break(self):
+        # 两台完全相同的设备：两种顺序的负载过程完全一致，取字典序最小编号序列
+        devices = [
+            StartupDevice("B2", "A", 5, 8),
+            StartupDevice("A1", "A", 5, 8),
+        ]
+        result = solve_startup_plan(devices, {"A": 100, "B": 0, "C": 0})
+        self.assertTrue(result.feasible)
+        self.assertEqual(result.order, ("A1", "B2"))
+
+    def test_startup_power_may_equal_rated(self):
+        # 启动瞬时功率允许恰好等于额定功率
+        devices = [StartupDevice("D1", "A", 10, 10)]
+        result = solve_startup_plan(devices, {"A": 10, "B": 0, "C": 0})
+        self.assertTrue(result.feasible)
+        self.assertEqual(result.peak_imbalance, 10)
+        self.assertEqual(
+            result.steps[0].transient_loads, result.steps[0].steady_loads
+        )
+
+    def test_final_steady_state_is_record_loads(self):
+        # 末步稳定负载与全部设备额定运行的固定分配一致
+        devices = [
+            StartupDevice("D1", "A", 6, 9),
+            StartupDevice("D2", "B", 4, 7),
+            StartupDevice("D3", "C", 5, 8),
+        ]
+        result = solve_startup_plan(devices, {"A": 10, "B": 10, "C": 10})
+        self.assertTrue(result.feasible)
+        self.assertEqual(
+            result.steps[-1].steady_loads, {"A": 6, "B": 4, "C": 5}
+        )
+        self.assertEqual(result.steps[-1].steady_imbalance, 2)
+        # 全过程峰值不小于最终稳定状态的负载差
+        self.assertGreaterEqual(result.peak_imbalance, 2)
+
+
+class StartupPlanFuzzTest(unittest.TestCase):
+    """与朴素全排列参照实现做随机对拍（含逐步负载仿真校验）。"""
+
+    def _simulate_and_check(self, result, devices, capacities):
+        """按返回顺序逐步仿真，校验瞬时/稳定负载、容量与峰值自洽。"""
+        by_code = {d.code: d for d in devices}
+        loads = {p: 0 for p in PHASES}
+        peak = 0
+        prev_code = None
+        self.assertEqual(tuple(s.code for s in result.steps), result.order)
+        for step in result.steps:
+            device = by_code[step.code]
+            self.assertEqual(step.phase, device.phase)
+            self.assertEqual(step.rated_power, device.rated_power)
+            self.assertEqual(step.startup_power, device.startup_power)
+            t_loads = dict(loads)
+            t_loads[device.phase] += device.startup_power
+            self.assertEqual(step.transient_loads, t_loads)
+            self.assertEqual(
+                step.transient_imbalance,
+                max(t_loads.values()) - min(t_loads.values()),
+            )
+            for p in PHASES:
+                self.assertLessEqual(t_loads[p], capacities[p])
+            loads[device.phase] += device.rated_power
+            self.assertEqual(step.steady_loads, loads)
+            self.assertEqual(
+                step.steady_imbalance,
+                max(loads.values()) - min(loads.values()),
+            )
+            for p in PHASES:
+                self.assertLessEqual(loads[p], capacities[p])
+            peak = max(peak, step.transient_imbalance, step.steady_imbalance)
+        self.assertEqual(peak, result.peak_imbalance)
+
+    def test_against_brute_force(self):
+        rng = random.Random(20260928)
+        for case in range(300):
+            n = rng.randint(1, 7)
+            devices = []
+            for i in range(n):
+                rated = rng.randint(1, 15)
+                startup = rated + rng.randint(0, 10)
+                devices.append(
+                    StartupDevice(
+                        f"DEV-{i}", rng.choice(PHASES), rated, startup
+                    )
+                )
+            capacities = {p: rng.randint(0, 60) for p in PHASES}
+
+            expected = brute_force_startup(devices, capacities)
+            result = solve_startup_plan(devices, capacities)
+
+            if expected is None:
+                self.assertFalse(result.feasible, f"case {case}: 应为无安全启动顺序")
+                continue
+            exp_peak, exp_seq = expected
+            self.assertTrue(result.feasible, f"case {case}: 应有安全启动顺序")
+            self.assertEqual(
+                result.peak_imbalance, exp_peak, f"case {case}: 峰值不符"
+            )
+            self.assertEqual(
+                result.order, exp_seq, f"case {case}: 字典序最小顺序不符"
+            )
+            self._simulate_and_check(result, devices, capacities)
+
+    def test_eight_devices_brute_force(self):
+        # 8! = 40320：全排列参照仍可承受，覆盖更大状态空间
+        rng = random.Random(20260929)
+        devices = []
+        for i in range(8):
+            rated = rng.randint(1, 12)
+            devices.append(
+                StartupDevice(f"D{i}", PHASES[i % 3], rated, rated + i)
+            )
+        capacities = {"A": 80, "B": 80, "C": 80}
+        result = solve_startup_plan(devices, capacities)
+        expected = brute_force_startup(devices, capacities)
+        self.assertEqual(result.peak_imbalance, expected[0])
+        self.assertEqual(result.order, expected[1])
+        self._simulate_and_check(result, devices, capacities)
+
+    def test_twelve_devices_performance(self):
+        # 12 台设备：子集 DP 状态 2^12=4096，应瞬时完成并自洽
+        devices = [
+            StartupDevice(
+                f"D{i:02d}", PHASES[i % 3], 2 * i + 1, 2 * i + 1 + (i % 4)
+            )
+            for i in range(12)
+        ]
+        capacities = {"A": 10**6, "B": 10**6, "C": 10**6}
+        result = solve_startup_plan(devices, capacities)
+        self.assertTrue(result.feasible)
+        self.assertEqual(len(result.order), 12)
+        self.assertEqual(set(result.order), {d.code for d in devices})
+        self._simulate_and_check(result, devices, capacities)
+
+    def test_twelve_devices_tight_capacity(self):
+        # 紧容量：12 台同相设备（额定均 1；D00 启动 3，其余启动 2），
+        # 额定总和 12。验证可行性剪枝、无解判定与顺序约束。
+        devices = [
+            StartupDevice(f"D{i:02d}", "A", 1, 3 if i == 0 else 2)
+            for i in range(12)
+        ]
+        # 容量 12：末台瞬时 11+2=13（或 D00 末台 11+3=14）均超容量，无解
+        result = solve_startup_plan(devices, {"A": 12, "B": 0, "C": 0})
+        self.assertFalse(result.feasible)
+
+        # 容量 13：非 D00 设备殿后瞬时恰为 13 可行，D00 殿后为 14 不可行，
+        # 故安全顺序中 D00 不得殿后；最优峰值必为 13（末台瞬时），
+        # 同峰值字典序最小顺序为 D00 最先、其余按编号排列
+        caps = {"A": 13, "B": 0, "C": 0}
+        result = solve_startup_plan(devices, caps)
+        self.assertTrue(result.feasible)
+        self.assertEqual(
+            result.order, tuple(f"D{i:02d}" for i in range(12))
+        )
+        self.assertEqual(result.peak_imbalance, 13)
+        self._simulate_and_check(result, devices, caps)
 
 
 if __name__ == "__main__":

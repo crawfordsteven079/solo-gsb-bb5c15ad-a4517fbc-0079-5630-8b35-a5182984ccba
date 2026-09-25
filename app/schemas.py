@@ -171,3 +171,68 @@ class RobustRehearsalResult(BaseModel):
         ..., description="稳健分配方案（按设备编号排序）；无解时为空"
     )
     message: str
+
+
+class StartupPowerIn(BaseModel):
+    """单台设备的启动瞬时功率。"""
+
+    device_id: str = Field(
+        ..., min_length=1, max_length=64, description="设备编号，须与计算记录一致"
+    )
+    startup_power: int = Field(
+        ..., gt=0, description="启动瞬时功率（正整数，不低于该设备额定功率）"
+    )
+
+
+class StartupPlanRequest(BaseModel):
+    """启动顺序预演请求体（仅预演，不修改历史计算记录）。"""
+
+    startup_powers: list[StartupPowerIn] = Field(
+        ...,
+        min_length=1,
+        max_length=12,
+        description="逐台设备的启动瞬时功率，设备编号须与记录完全一致",
+    )
+
+    @model_validator(mode="after")
+    def _unique_device_ids(self) -> "StartupPlanRequest":
+        ids = [d.device_id for d in self.startup_powers]
+        if len(ids) != len(set(ids)):
+            raise ValueError("设备编号必须唯一")
+        return self
+
+
+class StartupStep(BaseModel):
+    """启动顺序中的一步：某台设备的启动瞬间与其后的稳定状态。"""
+
+    device_id: str
+    phase: Phase
+    rated_power: int = Field(..., description="额定功率")
+    startup_power: int = Field(..., description="启动瞬时功率")
+    transient_loads: Loads = Field(..., description="启动瞬间各相负载")
+    transient_imbalance: int = Field(
+        ..., description="启动瞬间三相负载最大值与最小值之差"
+    )
+    steady_loads: Loads = Field(..., description="启动完成后各相稳定负载")
+    steady_imbalance: int = Field(
+        ..., description="稳定状态三相负载最大值与最小值之差"
+    )
+
+
+class StartupPlanResult(BaseModel):
+    """启动顺序预演结果（原计算记录不做任何修改）。"""
+
+    id: int
+    created_at: str
+    capacities: Loads = Field(..., description="各相容量（沿用原计算记录）")
+    feasible: bool = Field(..., description="是否存在安全启动顺序")
+    peak_imbalance: Optional[int] = Field(
+        None, description="全过程三相负载最大值与最小值之差的峰值"
+    )
+    startup_order: list[str] = Field(
+        ..., description="启动顺序（设备编号）；无安全顺序时为空"
+    )
+    steps: list[StartupStep] = Field(
+        ..., description="逐步的瞬时与稳定负载；无安全顺序时为空"
+    )
+    message: str

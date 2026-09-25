@@ -18,6 +18,11 @@
 且**任意功率组合下各相均不超容量**」的分配，并在其中最小化任意功率组合可能产生的
 三相最大负载与最小负载之差。预演结果**不写入历史计算记录**。
 
+对于**已有可行分配**的计算记录，服务还提供**启动顺序预演**接口：沿用记录中的
+固定相位与容量，逐台给定**不低于额定功率的启动瞬时功率**，设备一台接一台启动
+（启动瞬间按启动功率计，完成后按额定功率持续运行），求解使**全过程三相负载最大值
+与最小值之差的峰值**最小的启动顺序。预演同样**不修改历史记录**。
+
 ## 快速开始（一键启动）
 
 前置条件：已安装 Docker 与 Docker Compose 插件。
@@ -55,6 +60,7 @@ docker compose up --build
 | `GET` | `/api/v1/calculations` | 查询历史计算记录摘要（支持 `limit` / `offset` 分页） |
 | `GET` | `/api/v1/calculations/{id}` | 查询单条记录详情（含原始输入设备与分配结果） |
 | `POST` | `/api/v1/calculations/{id}/capacity-upgrade` | 为「无可行分配」的记录给出最小扩容建议（原记录不变） |
+| `POST` | `/api/v1/calculations/{id}/startup-plan` | 为「有可行分配」的记录预演负载差峰值最小的安全启动顺序（原记录不变） |
 | `POST` | `/api/v1/robust-rehearsals` | 稳健分相预演：设备功率为区间，求任意功率组合下均不超容量的最优分配（不持久化） |
 | `GET` | `/health` | 健康检查 |
 
@@ -258,6 +264,137 @@ curl -X POST http://localhost:8000/api/v1/robust-rehearsals \
 
 不满足规则时返回 `422` 及具体错误信息。
 
+## 启动顺序预演
+
+`POST /api/v1/calculations/{id}/startup-plan` 用于在已得到可行分配后，预演设备
+**一台接一台启动**的最优顺序。接口**沿用记录中的固定相位（每台设备的接入相位）
+与容量**，请求中逐台给出**启动瞬时功率**：
+
+- 启动瞬时功率为**正整数，且不低于该设备的额定功率**；
+- 请求中的**设备编号须与记录完全一致**（不多、不少、不重复）。
+
+启动过程：设备一次启动一台；**启动瞬间**该设备按启动瞬时功率计，此前已启动的设备
+按额定功率持续运行；**启动完成后**该设备亦按额定功率持续运行。每个启动瞬间及每个
+稳定状态下，A/B/C 各相负载均不得超过容量。接口在所有安全启动顺序中：
+
+1. **最小化全过程**「三相负载最大值与最小值之差」的**峰值**
+   （`peak_imbalance`，取所有启动瞬间与稳定状态的最大负载差）；
+2. 峰值相同时，取**设备编号序列字典序最小**的启动顺序。
+
+接口**只做预演，不修改历史计算记录**；不存在任何安全启动顺序时返回
+`feasible: false` 及说明信息。记录不存在返回 `404`；原记录无可行分配返回 `409`；
+启动功率低于额定功率或设备编号与记录不一致返回 `422`。
+
+### 请求示例
+
+```bash
+# 先创建一条可行计算记录（设备 D1/D2/D3 分别固定接 A/B/C）
+curl -X POST http://localhost:8000/api/v1/calculations \
+  -H "Content-Type: application/json" \
+  -d '{
+    "capacities": {"A": 10, "B": 10, "C": 10},
+    "devices": [
+      {"id": "D1", "power": 6, "allowed_phases": ["A"]},
+      {"id": "D2", "power": 4, "allowed_phases": ["B"]},
+      {"id": "D3", "power": 5, "allowed_phases": ["C"]}
+    ]
+  }'
+
+# 再对该记录请求启动顺序预演（假设记录 id 为 1）
+curl -X POST http://localhost:8000/api/v1/calculations/1/startup-plan \
+  -H "Content-Type: application/json" \
+  -d '{
+    "startup_powers": [
+      {"device_id": "D1", "startup_power": 8},
+      {"device_id": "D2", "startup_power": 6},
+      {"device_id": "D3", "startup_power": 9}
+    ]
+  }'
+```
+
+### 响应示例（存在安全启动顺序）
+
+```json
+{
+  "id": 1,
+  "created_at": "2026-09-25T08:00:00.000000+00:00",
+  "capacities": {"A": 10, "B": 10, "C": 10},
+  "feasible": true,
+  "peak_imbalance": 8,
+  "startup_order": ["D1", "D2", "D3"],
+  "steps": [
+    {
+      "device_id": "D1",
+      "phase": "A",
+      "rated_power": 6,
+      "startup_power": 8,
+      "transient_loads": {"A": 8, "B": 0, "C": 0},
+      "transient_imbalance": 8,
+      "steady_loads": {"A": 6, "B": 0, "C": 0},
+      "steady_imbalance": 6
+    },
+    {
+      "device_id": "D2",
+      "phase": "B",
+      "rated_power": 4,
+      "startup_power": 6,
+      "transient_loads": {"A": 6, "B": 6, "C": 0},
+      "transient_imbalance": 6,
+      "steady_loads": {"A": 6, "B": 4, "C": 0},
+      "steady_imbalance": 6
+    },
+    {
+      "device_id": "D3",
+      "phase": "C",
+      "rated_power": 5,
+      "startup_power": 9,
+      "transient_loads": {"A": 6, "B": 4, "C": 9},
+      "transient_imbalance": 5,
+      "steady_loads": {"A": 6, "B": 4, "C": 5},
+      "steady_imbalance": 2
+    }
+  ],
+  "message": "预演成功：已找到全过程三相负载最大值与最小值之差峰值最小的安全启动顺序"
+}
+```
+
+### 响应示例（无安全启动顺序）
+
+某设备启动功率 11，但其固定接入的 A 相容量仅为 10（额定功率 10 下记录本可行），
+任何顺序都无法安全启动该设备：
+
+```json
+{
+  "id": 2,
+  "created_at": "2026-09-25T08:01:00.000000+00:00",
+  "capacities": {"A": 10, "B": 0, "C": 0},
+  "feasible": false,
+  "peak_imbalance": null,
+  "startup_order": [],
+  "steps": [],
+  "message": "无安全启动顺序：不存在每个启动瞬间及稳定状态各相均不超容量的启动顺序"
+}
+```
+
+字段说明：
+
+| 字段 | 说明 |
+| --- | --- |
+| `peak_imbalance` | 全过程负载差峰值：所有启动瞬间与稳定状态的「最大相负载 − 最小相负载」的最大值 |
+| `startup_order` | 最优启动顺序（设备编号）；无安全顺序时为空数组 |
+| `steps[].phase` | 该设备沿用自计算记录的固定接入相位 |
+| `steps[].transient_loads` | 该设备**启动瞬间**各相负载（该设备按启动功率计） |
+| `steps[].transient_imbalance` | 启动瞬间三相负载最大值与最小值之差 |
+| `steps[].steady_loads` | 启动**完成后**各相稳定负载（该设备转入额定功率） |
+| `steps[].steady_imbalance` | 稳定状态三相负载最大值与最小值之差 |
+
+### 输入校验规则
+
+- `startup_powers` 为**非空**数组，设备编号**唯一**且与记录**完全一致**
+  （缺失、多余均返回 `422`）；
+- 每台设备的 `startup_power` 为**正整数**，且**不低于其额定功率**；
+- 记录不存在返回 `404`；原记录 `feasible=false` 返回 `409`。
+
 ## 本地开发
 
 ```bash
@@ -309,3 +446,13 @@ python3 -m unittest tests.test_solver  # 仅求解器测试（无第三方依赖
 - 下界最小值」：同一相不可能同时取到上界与下界，故只取相异相位对）。据此在与
 主求解器相同的 DFS 框架（按设备编号排序、相位按 A→B→C 展开、仅严格更优才更新、
 容量约束与下界剪枝）中直接求解，12 台设备的最坏情形亦可在数秒内完成。
+
+**启动顺序预演**（`startup-plan`）利用「顺序即子集路径」的结构：任一启动顺序对应
+子集 DAG 上 空集→全集 的一条路径——途经节点为已启动设备集合（其稳定状态负载只
+取决于该集合），途经边为一次启动（瞬时负载只取决于启动前集合与该设备）。节点与
+边的负载差均与到达路径无关，故「最小化全过程负载差峰值」等价于该 DAG 上的
+**minimax 路径**：按子集递推各集合的最小可达峰值即可（设备不超过 12 台，状态数
+`2^12 = 4096`，瞬时完成）；不存在满足容量的路径时即为无安全顺序。得到最优峰值后，
+先自全集反向递推「途经负载差均不超最优峰值、且满足容量时可达全集」的集合，再从
+空集出发每一步选取「后缀仍可完成」的编号最小设备，所得顺序即同峰值下设备编号
+序列字典序最小者。
